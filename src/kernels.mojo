@@ -3,11 +3,15 @@
 from max.algorithm import parallelize
 from std.math import sqrt
 from std.runtime import initialize_runtime
+from std.sys.info import simd_width_of as simdwidthof
 
 
-comptime W = 4
+comptime W = simdwidthof[DType.float64]()
 comptime UNROLL = 4
 comptime PAIRWISE_PARALLEL_THRESHOLD = 1_000_000
+comptime PAIRED_PARALLEL_THRESHOLD = 1_000_000
+comptime TRANSFORM_PARALLEL_THRESHOLD = 2_097_153
+comptime TRANSFORM_CHUNK_SIZE = 2_097_152
 comptime Ptr = Pointer[Float64, AnyOrigin[mut=True]]
 
 
@@ -114,6 +118,22 @@ def pairwise_kernel(
 
 
 def paired_kernel(a: Ptr, b: Ptr, dst: Ptr, rows: Int, cols: Int, metric: Int):
+    if rows * cols >= PAIRED_PARALLEL_THRESHOLD:
+
+        def paired_row(i: Int) {imm}:
+            dst.unsafe_store(
+                i,
+                distance_kernel(
+                    a.unsafe_offset(i * cols),
+                    b.unsafe_offset(i * cols),
+                    cols,
+                    metric,
+                ),
+            )
+
+        parallelize(paired_row, rows, 8)
+        return
+
     for i in range(rows):
         dst.unsafe_store(
             i,
@@ -148,7 +168,7 @@ def mahalanobis_kernel(a: Ptr, b: Ptr, matrix: Ptr, n: Int) -> Float64:
     return sqrt(total) if total > 0.0 else 0.0
 
 
-def wsum_kernel(
+def wsum_range(
     a: Ptr, b: Ptr, dst: Ptr, n: Int, alpha: Float64, beta: Float64
 ):
     var va = SIMD[DType.float64, W](alpha)
@@ -182,6 +202,30 @@ def wsum_kernel(
     while i < n:
         dst.unsafe_store(i, alpha * a.unsafe_load(i) + beta * b.unsafe_load(i))
         i += 1
+
+
+def wsum_kernel(
+    a: Ptr, b: Ptr, dst: Ptr, n: Int, alpha: Float64, beta: Float64
+):
+    if n < TRANSFORM_PARALLEL_THRESHOLD:
+        wsum_range(a, b, dst, n, alpha, beta)
+        return
+
+    var chunks = (n + TRANSFORM_CHUNK_SIZE - 1) // TRANSFORM_CHUNK_SIZE
+
+    def wsum_chunk(chunk: Int) {imm}:
+        var offset = chunk * TRANSFORM_CHUNK_SIZE
+        var size = min(TRANSFORM_CHUNK_SIZE, n - offset)
+        wsum_range(
+            a.unsafe_offset(offset),
+            b.unsafe_offset(offset),
+            dst.unsafe_offset(offset),
+            size,
+            alpha,
+            beta,
+        )
+
+    parallelize(wsum_chunk, chunks, 2)
 
 
 def fma_kernel(
@@ -264,6 +308,7 @@ def mss_pairwise(
 def mss_paired(
     a: Int, b: Int, dst: Int, rows: Int, cols: Int, metric: Int
 ) abi("C"):
+    initialize_runtime()
     paired_kernel(ptr(a), ptr(b), ptr(dst), rows, cols, metric)
 
 
@@ -281,6 +326,7 @@ def mss_mahalanobis(a: Int, b: Int, matrix: Int, n: Int) abi("C") -> Float64:
 def mss_wsum(
     a: Int, b: Int, dst: Int, n: Int, alpha: Float64, beta: Float64
 ) abi("C"):
+    initialize_runtime()
     wsum_kernel(ptr(a), ptr(b), ptr(dst), n, alpha, beta)
 
 

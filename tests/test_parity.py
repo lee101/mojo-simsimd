@@ -57,6 +57,15 @@ def test_cdist_parallel_threshold(rows):
     assert np.allclose(mojo.cdist(a, b), simsimd.cdist(a, b, metric="sqeuclidean"), rtol=2e-12, atol=2e-12)
 
 
+@pytest.mark.parametrize("rows", [3891, 3892])
+def test_paired_parallel_threshold(rows):
+    rng = np.random.default_rng(rows)
+    a = rng.normal(size=(rows, 257))
+    b = rng.normal(size=(rows, 257))
+    expected = np.sum(a * b, axis=1)
+    assert np.allclose(mojo.dot(a, b), expected, rtol=2e-12, atol=2e-12)
+
+
 def test_bilinear_and_mahalanobis_parity(vectors):
     a, b = vectors
     rng = np.random.default_rng(7)
@@ -92,6 +101,14 @@ def test_transform_simd_tails(size):
     c = np.linspace(0.5, 1.5, size)
     assert np.allclose(mojo.wsum(a, b, alpha=-0.75, beta=1.25), simsimd.wsum(a, b, alpha=-0.75, beta=1.25))
     assert np.allclose(mojo.fma(a, b, c, alpha=-0.75, beta=1.25), simsimd.fma(a, b, c, alpha=-0.75, beta=1.25))
+
+
+@pytest.mark.parametrize("size", [2_097_152, 2_097_155])
+def test_wsum_parallel_threshold_and_tail(size):
+    a = np.linspace(-1.0, 1.0, size)
+    b = np.linspace(1.0, -1.0, size)
+    expected = -0.75 * a + 1.25 * b
+    assert np.allclose(mojo.wsum(a, b, alpha=-0.75, beta=1.25), expected)
 
 
 def test_zero_norm_cosine_matches_upstream():
