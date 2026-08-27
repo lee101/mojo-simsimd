@@ -55,7 +55,7 @@ The pairwise kernel parallelizes independent output rows once the input size cro
 
 `src/kernels.mojo` is intentionally one compilation unit: it produces one shared library, `dist/libmojo-simsimd.so`. Core reductions use four-lane `Float64` SIMD plus scalar tails. Matrices are dense, row-major, C-contiguous buffers.
 
-Python validates shapes and dtypes, makes C-contiguous Float64 input arrays, and keeps those arrays alive for the duration of each `ctypes` call. Empty inputs are handled in Python so a null/empty NumPy buffer never reaches the native ABI. Each `@export` Mojo wrapper reconstructs an `UnsafePointer[Float64, AnyOrigin[mut=True]]`; Mojo does not allocate or own Python memory. A contiguous Float64 output can be written directly; other valid output views use a temporary and are copied back.
+Python validates shapes and dtypes, makes C-contiguous Float64 input arrays, and keeps those arrays alive for the duration of each `ctypes` call. Empty inputs are handled in Python so a null/empty NumPy buffer never reaches the native ABI. Each `@export` Mojo wrapper reconstructs a `Pointer[Float64, AnyOrigin[mut=True]]`; Mojo does not allocate or own Python memory. A contiguous Float64 output can be written directly; other valid output views use a temporary and are copied back.
 
 ## License
 

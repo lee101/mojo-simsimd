@@ -1,12 +1,14 @@
 """Float64 SIMD distance kernels and their small C ABI."""
 
+from max.algorithm import parallelize
 from std.math import sqrt
-from std.algorithm.functional import parallelize
+from std.runtime import initialize_runtime
+
 
 comptime W = 4
 comptime UNROLL = 4
 comptime PAIRWISE_PARALLEL_THRESHOLD = 1_000_000
-comptime Ptr = UnsafePointer[Float64, AnyOrigin[mut=True]]
+comptime Ptr = Pointer[Float64, AnyOrigin[mut=True]]
 
 
 def ptr(addr: Int) -> Ptr:
@@ -17,11 +19,11 @@ def dot_kernel(a: Ptr, b: Ptr, n: Int) -> Float64:
     var acc = SIMD[DType.float64, W](0.0)
     var i = 0
     while i + W <= n:
-        acc += a.load[width=W](i) * b.load[width=W](i)
+        acc += a.unsafe_load[width=W](i) * b.unsafe_load[width=W](i)
         i += W
     var total = acc.reduce_add()
     while i < n:
-        total += a[i] * b[i]
+        total += a.unsafe_load(i) * b.unsafe_load(i)
         i += 1
     return total
 
@@ -30,12 +32,12 @@ def sqeuclidean_kernel(a: Ptr, b: Ptr, n: Int) -> Float64:
     var acc = SIMD[DType.float64, W](0.0)
     var i = 0
     while i + W <= n:
-        var delta = a.load[width=W](i) - b.load[width=W](i)
+        var delta = a.unsafe_load[width=W](i) - b.unsafe_load[width=W](i)
         acc += delta * delta
         i += W
     var total = acc.reduce_add()
     while i < n:
-        var delta = a[i] - b[i]
+        var delta = a.unsafe_load(i) - b.unsafe_load(i)
         total += delta * delta
         i += 1
     return total
@@ -47,8 +49,8 @@ def cosine_kernel(a: Ptr, b: Ptr, n: Int) -> Float64:
     var b_acc = SIMD[DType.float64, W](0.0)
     var i = 0
     while i + W <= n:
-        var av = a.load[width=W](i)
-        var bv = b.load[width=W](i)
+        var av = a.unsafe_load[width=W](i)
+        var bv = b.unsafe_load[width=W](i)
         dot_acc += av * bv
         a_acc += av * av
         b_acc += bv * bv
@@ -57,9 +59,11 @@ def cosine_kernel(a: Ptr, b: Ptr, n: Int) -> Float64:
     var a_total = a_acc.reduce_add()
     var b_total = b_acc.reduce_add()
     while i < n:
-        dot_total += a[i] * b[i]
-        a_total += a[i] * a[i]
-        b_total += b[i] * b[i]
+        var av = a.unsafe_load(i)
+        var bv = b.unsafe_load(i)
+        dot_total += av * bv
+        a_total += av * av
+        b_total += bv * bv
         i += 1
     if a_total == 0.0 or b_total == 0.0:
         return 0.0 if a_total == b_total else 1.0
@@ -76,22 +80,50 @@ def distance_kernel(a: Ptr, b: Ptr, n: Int, metric: Int) -> Float64:
     return dot_kernel(a, b, n)
 
 
-def pairwise_kernel(a: Ptr, b: Ptr, dst: Ptr, rows_a: Int, rows_b: Int, cols: Int, metric: Int):
+def pairwise_kernel(
+    a: Ptr, b: Ptr, dst: Ptr, rows_a: Int, rows_b: Int, cols: Int, metric: Int
+):
     if rows_a * rows_b * cols >= PAIRWISE_PARALLEL_THRESHOLD:
-        @parameter
-        def pairwise_row(i: Int):
+
+        def pairwise_row(i: Int) {imm}:
             for j in range(rows_b):
-                dst[i * rows_b + j] = distance_kernel(a + i * cols, b + j * cols, cols, metric)
-        parallelize[pairwise_row](rows_a, 8)
+                dst.unsafe_store(
+                    i * rows_b + j,
+                    distance_kernel(
+                        a.unsafe_offset(i * cols),
+                        b.unsafe_offset(j * cols),
+                        cols,
+                        metric,
+                    ),
+                )
+
+        parallelize(pairwise_row, rows_a, 8)
         return
+
     for i in range(rows_a):
         for j in range(rows_b):
-            dst[i * rows_b + j] = distance_kernel(a + i * cols, b + j * cols, cols, metric)
+            dst.unsafe_store(
+                i * rows_b + j,
+                distance_kernel(
+                    a.unsafe_offset(i * cols),
+                    b.unsafe_offset(j * cols),
+                    cols,
+                    metric,
+                ),
+            )
 
 
 def paired_kernel(a: Ptr, b: Ptr, dst: Ptr, rows: Int, cols: Int, metric: Int):
     for i in range(rows):
-        dst[i] = distance_kernel(a + i * cols, b + i * cols, cols, metric)
+        dst.unsafe_store(
+            i,
+            distance_kernel(
+                a.unsafe_offset(i * cols),
+                b.unsafe_offset(i * cols),
+                cols,
+                metric,
+            ),
+        )
 
 
 def bilinear_kernel(a: Ptr, b: Ptr, matrix: Ptr, n: Int) -> Float64:
@@ -99,8 +131,8 @@ def bilinear_kernel(a: Ptr, b: Ptr, matrix: Ptr, n: Int) -> Float64:
     for i in range(n):
         var row_total = 0.0
         for j in range(n):
-            row_total += matrix[i * n + j] * b[j]
-        total += a[i] * row_total
+            row_total += matrix.unsafe_load(i * n + j) * b.unsafe_load(j)
+        total += a.unsafe_load(i) * row_total
     return total
 
 
@@ -109,44 +141,94 @@ def mahalanobis_kernel(a: Ptr, b: Ptr, matrix: Ptr, n: Int) -> Float64:
     for i in range(n):
         var row_total = 0.0
         for j in range(n):
-            row_total += matrix[i * n + j] * (b[j] - a[j])
-        total += (b[i] - a[i]) * row_total
+            row_total += matrix.unsafe_load(i * n + j) * (
+                b.unsafe_load(j) - a.unsafe_load(j)
+            )
+        total += (b.unsafe_load(i) - a.unsafe_load(i)) * row_total
     return sqrt(total) if total > 0.0 else 0.0
 
 
-def wsum_kernel(a: Ptr, b: Ptr, dst: Ptr, n: Int, alpha: Float64, beta: Float64):
+def wsum_kernel(
+    a: Ptr, b: Ptr, dst: Ptr, n: Int, alpha: Float64, beta: Float64
+):
     var va = SIMD[DType.float64, W](alpha)
     var vb = SIMD[DType.float64, W](beta)
     var i = 0
     while i + W * UNROLL <= n:
-        dst.store(i, va * a.load[width=W](i) + vb * b.load[width=W](i))
-        dst.store(i + W, va * a.load[width=W](i + W) + vb * b.load[width=W](i + W))
-        dst.store(i + 2 * W, va * a.load[width=W](i + 2 * W) + vb * b.load[width=W](i + 2 * W))
-        dst.store(i + 3 * W, va * a.load[width=W](i + 3 * W) + vb * b.load[width=W](i + 3 * W))
+        dst.unsafe_store(
+            i, va * a.unsafe_load[width=W](i) + vb * b.unsafe_load[width=W](i)
+        )
+        dst.unsafe_store(
+            i + W,
+            va * a.unsafe_load[width=W](i + W)
+            + vb * b.unsafe_load[width=W](i + W),
+        )
+        dst.unsafe_store(
+            i + 2 * W,
+            va * a.unsafe_load[width=W](i + 2 * W)
+            + vb * b.unsafe_load[width=W](i + 2 * W),
+        )
+        dst.unsafe_store(
+            i + 3 * W,
+            va * a.unsafe_load[width=W](i + 3 * W)
+            + vb * b.unsafe_load[width=W](i + 3 * W),
+        )
         i += W * UNROLL
     while i + W <= n:
-        dst.store(i, va * a.load[width=W](i) + vb * b.load[width=W](i))
+        dst.unsafe_store(
+            i, va * a.unsafe_load[width=W](i) + vb * b.unsafe_load[width=W](i)
+        )
         i += W
     while i < n:
-        dst[i] = alpha * a[i] + beta * b[i]
+        dst.unsafe_store(i, alpha * a.unsafe_load(i) + beta * b.unsafe_load(i))
         i += 1
 
 
-def fma_kernel(a: Ptr, b: Ptr, c: Ptr, dst: Ptr, n: Int, alpha: Float64, beta: Float64):
+def fma_kernel(
+    a: Ptr, b: Ptr, c: Ptr, dst: Ptr, n: Int, alpha: Float64, beta: Float64
+):
     var va = SIMD[DType.float64, W](alpha)
     var vb = SIMD[DType.float64, W](beta)
     var i = 0
     while i + W * UNROLL <= n:
-        dst.store(i, va * a.load[width=W](i) * b.load[width=W](i) + vb * c.load[width=W](i))
-        dst.store(i + W, va * a.load[width=W](i + W) * b.load[width=W](i + W) + vb * c.load[width=W](i + W))
-        dst.store(i + 2 * W, va * a.load[width=W](i + 2 * W) * b.load[width=W](i + 2 * W) + vb * c.load[width=W](i + 2 * W))
-        dst.store(i + 3 * W, va * a.load[width=W](i + 3 * W) * b.load[width=W](i + 3 * W) + vb * c.load[width=W](i + 3 * W))
+        dst.unsafe_store(
+            i,
+            va * a.unsafe_load[width=W](i) * b.unsafe_load[width=W](i)
+            + vb * c.unsafe_load[width=W](i),
+        )
+        dst.unsafe_store(
+            i + W,
+            va * a.unsafe_load[width=W](i + W) * b.unsafe_load[width=W](i + W)
+            + vb * c.unsafe_load[width=W](i + W),
+        )
+        dst.unsafe_store(
+            i + 2 * W,
+            va
+            * a.unsafe_load[width=W](i + 2 * W)
+            * b.unsafe_load[width=W](i + 2 * W)
+            + vb * c.unsafe_load[width=W](i + 2 * W),
+        )
+        dst.unsafe_store(
+            i + 3 * W,
+            va
+            * a.unsafe_load[width=W](i + 3 * W)
+            * b.unsafe_load[width=W](i + 3 * W)
+            + vb * c.unsafe_load[width=W](i + 3 * W),
+        )
         i += W * UNROLL
     while i + W <= n:
-        dst.store(i, va * a.load[width=W](i) * b.load[width=W](i) + vb * c.load[width=W](i))
+        dst.unsafe_store(
+            i,
+            va * a.unsafe_load[width=W](i) * b.unsafe_load[width=W](i)
+            + vb * c.unsafe_load[width=W](i),
+        )
         i += W
     while i < n:
-        dst[i] = alpha * a[i] * b[i] + beta * c[i]
+        dst.unsafe_store(
+            i,
+            alpha * a.unsafe_load(i) * b.unsafe_load(i)
+            + beta * c.unsafe_load(i),
+        )
         i += 1
 
 
@@ -171,12 +253,17 @@ def mss_cosine(a: Int, b: Int, n: Int) abi("C") -> Float64:
 
 
 @export("mss_pairwise")
-def mss_pairwise(a: Int, b: Int, dst: Int, rows_a: Int, rows_b: Int, cols: Int, metric: Int) abi("C"):
+def mss_pairwise(
+    a: Int, b: Int, dst: Int, rows_a: Int, rows_b: Int, cols: Int, metric: Int
+) abi("C"):
+    initialize_runtime()
     pairwise_kernel(ptr(a), ptr(b), ptr(dst), rows_a, rows_b, cols, metric)
 
 
 @export("mss_paired")
-def mss_paired(a: Int, b: Int, dst: Int, rows: Int, cols: Int, metric: Int) abi("C"):
+def mss_paired(
+    a: Int, b: Int, dst: Int, rows: Int, cols: Int, metric: Int
+) abi("C"):
     paired_kernel(ptr(a), ptr(b), ptr(dst), rows, cols, metric)
 
 
@@ -191,10 +278,14 @@ def mss_mahalanobis(a: Int, b: Int, matrix: Int, n: Int) abi("C") -> Float64:
 
 
 @export("mss_wsum")
-def mss_wsum(a: Int, b: Int, dst: Int, n: Int, alpha: Float64, beta: Float64) abi("C"):
+def mss_wsum(
+    a: Int, b: Int, dst: Int, n: Int, alpha: Float64, beta: Float64
+) abi("C"):
     wsum_kernel(ptr(a), ptr(b), ptr(dst), n, alpha, beta)
 
 
 @export("mss_fma")
-def mss_fma(a: Int, b: Int, c: Int, dst: Int, n: Int, alpha: Float64, beta: Float64) abi("C"):
+def mss_fma(
+    a: Int, b: Int, c: Int, dst: Int, n: Int, alpha: Float64, beta: Float64
+) abi("C"):
     fma_kernel(ptr(a), ptr(b), ptr(c), ptr(dst), n, alpha, beta)
